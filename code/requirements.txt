@@ -1,0 +1,12 @@
+streamlit>=1.35.0
+pandas>=2.0.0
+numpy>=1.25.0
+requests>=2.31.0
+faiss-cpu>=1.7.4
+sentence-transformers>=2.2.2
+python-constraint>=1.4.0
+pybloom-live>=3.0.0
+sqlalchemy>=2.0.0
+tqdm>=4.65.0
+python-dotenv>=1.0.0
+plotly>=5.15.0
