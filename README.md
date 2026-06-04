@@ -1,5 +1,4 @@
 # NutriAI — Automated Diet Plan Builder
-**BAX-423 Big Data · Spring 2026 · Final Project**
 
 ---
 
@@ -87,7 +86,7 @@ The app is pre-tested against 4 clinical personas:
 
 ---
 
-## BAX-423 Techniques Used
+##Class Techniques Used
 
 1. **FAISS Embeddings** — Foods are embedded using sentence-transformers and indexed
    with FAISS for fast semantic similarity search during meal selection and ranking.
