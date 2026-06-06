@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-
+import re
 import pandas as pd
 from pybloom_live import BloomFilter
 
@@ -122,8 +122,8 @@ class FilterEngine:
 
     # Pork/lard keywords for religious/preference exclusions
     PORK_KEYWORDS   = {"pork", "bacon", "ham", "lard", "prosciutto", "salami",
-                       "pepperoni", "sausage", "pancetta", "chorizo"}
-    BEEF_KEYWORDS   = {"beef", "steak", "veal", "brisket", "burger", "meatball"}
+                       "pepperoni", "sausage", "pancetta", "chorizo", "meat", "burrito"}
+    BEEF_KEYWORDS   = {"beef", "steak", "veal", "brisket", "burger", "meatball", "meat", "burrito"}
     ALCOHOL_KEYWORDS = {"wine", "beer", "ale", "lager", "spirits", "vodka",
                         "rum", "whiskey", "whisky", "bourbon", "liqueur",
                         "brandy", "sake", "mead"}
@@ -211,61 +211,76 @@ class FilterEngine:
 
         # ── 3. IBS / Low-FODMAP filter ────────────────────────────────────────
         if profile.has_ibs:
+            # Drop structural high-FODMAP database designations
             mask_fodmap = df["is_high_fodmap"] == 1
-            for fid in df.loc[mask_fodmap, "fdc_id"]:
-                log.add(fid, "Excluded: high-FODMAP food, unsafe for IBS")
             df = df[~mask_fodmap]
+            
+            # Runtime name sweep for high-FODMAP food categories and aromatics
+            IBS_CATCH = {"garlic", "onion", "shallot", "leek", "buttermilk", "milk", "honey", "bean", "lentil", "apple", "pear"}
+            pattern = "|".join(r"\b" + re.escape(k) + r"s?\b" for k in IBS_CATCH)
+            df = df[~df["name"].str.contains(pattern, case=False, na=False, regex=True)]
 
         # ── 4. GERD filter ────────────────────────────────────────────────────
+        # ✅ PLACE THIS NEW GERD BLOCK:
         if profile.has_gerd:
             mask_gerd = df["is_gerd_trigger"] == 1
             for fid in df.loc[mask_gerd, "fdc_id"]:
-                log.add(fid, "Excluded: GERD trigger food (citrus/tomato/spicy/fried/caffeine)")
+                log.add(fid, "Excluded: Base database GERD trigger food classification")
             df = df[~mask_gerd]
+            
+            # Broaden catch for carbonation, citrus, high pastry fats, and chocolate/mint escapes
+            GERD_CATCH = {
+                "coffee", "tea", "cola", "soda", "citrus", "lemon", "lime", "orange", 
+                "tomato", "mint", "chocolate", "cheese snack", "cream puff", "cobbler", 
+                "pastry", "croissant", "fried", "spicy", "chili", "hot sauce"
+            }
+            pattern = "|".join(r"\b" + re.escape(k) + r"s?\b" for k in GERD_CATCH)
+            mask_gerd_words = df["name"].str.contains(pattern, case=False, na=False, regex=True)
+            
+            for fid in df.loc[mask_gerd_words, "fdc_id"]:
+                log.add(fid, "Excluded: High-fat pastry, acid, or gastric-irritant trigger (GERD protection)")
+            df = df[~mask_gerd_words]
 
-            # Extra keyword sweep for fried and spicy (not always caught by DB flag)
-            mask_fried = self._name_contains(df["name"], self.FRIED_KEYWORDS)
-            for fid in df.loc[mask_fried, "fdc_id"]:
-                log.add(fid, "Excluded: fried food, GERD trigger")
-            df = df[~mask_fried]
-
-            mask_spicy = self._name_contains(df["name"], self.SPICY_KEYWORDS)
-            for fid in df.loc[mask_spicy, "fdc_id"]:
-                log.add(fid, "Excluded: spicy food, GERD trigger")
-            df = df[~mask_spicy]
-
-        # ── 5. Diabetes / Glycaemic Index filter ──────────────────────────────
+        # ── 5. Diabetes filter ────────────────────────────────────────────────
         if profile.has_diabetes:
-            gi_cap = profile.gi_cap or 55
-            # Only exclude foods where GI is known AND above cap
-            mask_high_gi = df["glycaemic_index"].notna() & (df["glycaemic_index"] > gi_cap)
-            for fid in df.loc[mask_high_gi, "fdc_id"]:
+            # Pass A: Check the database Glycaemic Index numeric column
+            cap = profile.gi_cap if profile.gi_cap is not None else 55.0
+            mask_gi = df["glycaemic_index"].notna() & (df["glycaemic_index"] > cap)
+            for fid in df.loc[mask_gi, "fdc_id"]:
                 gi_val = df.loc[df["fdc_id"] == fid, "glycaemic_index"].values[0]
-                log.add(fid, f"Excluded: GI={gi_val:.0f} > {gi_cap} (diabetes threshold)")
-            df = df[~mask_high_gi]
+                log.add(fid, f"Excluded: glycaemic_index={gi_val:.1f} > {cap} clinical cap (Type 2 Diabetes)")
+            df = df[~mask_gi]
 
-            # Flag high-sugar foods by name (honey, syrup, candy, etc.)
-            SUGAR_KEYWORDS = {"sugar", "syrup", "honey", "candy", "dessert",
-                              "soda", "juice", "sweetened", "white rice", "white bread"}
-            mask_sugar = self._name_contains(df["name"], SUGAR_KEYWORDS)
-            for fid in df.loc[mask_sugar, "fdc_id"]:
-                log.add(fid, "Excluded: high added sugar, not suitable for Type 2 diabetes")
-            df = df[~mask_sugar]
+            # Pass B: Runtime High-Sugar/Bakery indicator net (catches text escapes instantly)
+            HIGH_SUGAR_SWEETS = {
+                "churro", "fritter", "caramel", "chocolate", "fudge", "baklava", 
+                "croissant", "tart", "cobbler", "crisp", "puff", "beignet", "basbousa",
+                "cookie", "cake", "candy", "pie", "doughnut", "donut", "pastry", "syrup", "sweetened"
+            }
+            # Modifies the expression to catch both singular and plural forms (e.g., churro and churros)
+            pattern = "|".join(r"\b" + re.escape(k) + r"s?\b" for k in HIGH_SUGAR_SWEETS)
+            mask_sweets = df["name"].str.contains(pattern, case=False, na=False, regex=True)
+            
+            for fid in df.loc[mask_sweets, "fdc_id"]:
+                log.add(fid, "Excluded: High glycaemic sugar/bakery item, unsafe for Type 2 Diabetes")
+            df = df[~mask_sweets]
 
-        # ── 6. Hypertension / DASH filter ─────────────────────────────────────
+       # ── 6. Hypertension / DASH filter ─────────────────────────────────────
         if profile.has_hypertension:
-            # Cap sodium at 1500 mg per 100g serving (very high-sodium processed foods)
-            SODIUM_CAP = 1500
-            mask_sodium = df["sodium_mg"].notna() & (df["sodium_mg"] > SODIUM_CAP)
-            for fid in df.loc[mask_sodium, "fdc_id"]:
-                na_val = df.loc[df["fdc_id"] == fid, "sodium_mg"].values[0]
-                log.add(fid, f"Excluded: sodium={na_val:.0f}mg/100g > {SODIUM_CAP}mg cap (hypertension)")
-            df = df[~mask_sodium]
+            # Drop any item that has a sodium density greater than 1.5 mg per calorie
+            # This shields hypertensive users from low-calorie sodium traps like buttermilk and light dairy
+            mask_density = (
+                df["sodium_mg"].notna() & 
+                df["calories"].notna() & 
+                (df["calories"] > 0) & 
+                (df["sodium_mg"] / df["calories"] > 1.5)
+            )
+            for fid in df.loc[mask_density, "fdc_id"]:
+                log.add(fid, "Excluded: Sodium density exceeds strict 1.5 mg/kcal DASH target limit")
+            df = df[~mask_density]
 
-            # Also exclude by name: pickled, cured, heavily processed
+            # Keep the high-sodium processed keyword fallback active
             mask_salty = self._name_contains(df["name"], self.SODIUM_HIGH_KEYWORDS)
-            for fid in df.loc[mask_salty, "fdc_id"]:
-                log.add(fid, "Excluded: high-sodium processed food (DASH diet)")
             df = df[~mask_salty]
 
         # ── 7. Cultural/religious constraints ─────────────────────────────────

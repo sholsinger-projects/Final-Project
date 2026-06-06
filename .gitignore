@@ -1,0 +1,9 @@
+# Ignore compiled python bytecode files
+__pycache__/
+*.pyc
+
+# School requirements to exclude from public repo
+prompts.md
+code/test_submission.py
+code/generate_brief.py
+prompts.md

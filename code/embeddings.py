@@ -188,7 +188,8 @@ class FoodEmbeddingIndex:
 
     def diversity_score(self, fdc_ids: list[int]) -> float:
         """
-        Compute the mean pairwise dissimilarity of a list of foods.
+        Reconstructs vectors from the index and compute the mean pairwise 
+        cosine dissimilarity across all 21 meals
         Returns a score in [0, 1] where 1 = maximally diverse.
         Used to evaluate and enforce diversity in generated meal plans.
         """

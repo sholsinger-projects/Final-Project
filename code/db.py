@@ -86,28 +86,67 @@ RDA_ADULT_FEMALE = {
 }
 
 
-def get_rda(sex: str, age: int, calorie_target: float = None) -> dict:
+def get_rda(
+    sex: str, 
+    age: int, 
+    calorie_target: float = None, 
+    has_hypertension: bool = False, 
+    has_diabetes: bool = False,
+    has_gerd: bool = False,
+    has_ibs: bool = False
+) -> dict:
     """
     Return an RDA dict for the given sex/age, optionally overriding calorie target.
-    sex: 'male' | 'female'
-    age: integer years
+    Adjusts values dynamically to align with NHLBI DASH diet guidelines, diabetic 
+    carb limits, GERD fat caps, and IBS fiber targets.
     """
     base = RDA_ADULT_MALE.copy() if sex.lower() == "male" else RDA_ADULT_FEMALE.copy()
 
     # Scale macros to user's calorie target if provided
     if calorie_target:
-        ratio = calorie_target / base["calories"]
-        base["calories"]  = calorie_target
-        base["protein_g"] = round(base["protein_g"] * ratio, 1)
-        base["carbs_g"]   = round(calorie_target * 0.50 / 4, 1)  # 50% of kcal from carbs
-        base["fat_g"]     = round(calorie_target * 0.30 / 9, 1)  # 30% from fat
+        base["calories"] = calorie_target
+        
+        # ─── Macro Allocation Priority Tree ───
+        # 1. Diabetes: Drop carbs to a controlled 35% tier, shift to high protein
+        if has_diabetes:
+            carb_pct = 0.35
+            protein_pct = 0.35
+            fat_pct = 0.30
+        # 2. GERD: Reduce fat down to a strict 22% limit to prevent gastric reflux loading
+        elif has_gerd:
+            carb_pct = 0.53
+            protein_pct = 0.25
+            fat_pct = 0.22
+        # 3. Standard baseline macro configuration
+        else:
+            carb_pct = 0.50
+            protein_pct = 0.20
+            fat_pct = 0.30
 
-    # Age adjustments (simplified)
+        base["protein_g"] = round(calorie_target * protein_pct / 4, 1)
+        base["carbs_g"]   = round(calorie_target * carb_pct / 4, 1)
+        base["fat_g"]     = round(calorie_target * fat_pct / 9, 1)
+
+    # Age adjustments
     if age >= 71:
         base["calcium_mg"]   = 1200
         base["vitamin_d_iu"] = 800
     elif age >= 51:
         base["calcium_mg"]   = 1200 if sex.lower() == "female" else 1000
         base["vitamin_d_iu"] = 600
+
+    # ─── Clinical Condition Fine-Tuning ───
+    
+    # IBS Profile Adjustments (Fiber Control)
+    if has_ibs:
+        # Stabilize fiber to a moderate therapeutic ceiling (~20g) to prevent bowel fermentation spikes
+        base["fibre_g"] = 20.0
+
+    # DASH Diet Adjustments (Hypertension Control)
+    if has_hypertension:
+        base["sodium_mg"]    = 1500.0  # Strict DASH target cap
+        base["potassium_mg"] = 4700.0  # Elevated target to offset sodium
+        base["calcium_mg"]   = max(base["calcium_mg"], 1200.0)
+        base["magnesium_mg"] = max(base["magnesium_mg"], 500.0)
 
     return base

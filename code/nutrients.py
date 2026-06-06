@@ -85,19 +85,31 @@ class DayNutrients:
 
 
 def _meal_nutrients(meal: Meal) -> dict[str, float]:
-    """Sum nutrient values across all foods in a meal."""
-    totals = {n: 0.0 for n in TRACKED}
+    """
+    Sum nutrient values across all foods in a meal.
+    Returns None for a nutrient if NO food in the meal reported it,
+    so we can distinguish "genuinely zero" from "data not available".
+    """
+    totals  = {n: None for n in TRACKED}
     for food in meal.foods:
         for n in TRACKED:
-            totals[n] += food.get(n) or 0.0
+            val = food.get(n)
+            # Ensure the value is neither Python None nor a Pandas/NumPy NaN
+            if val is not None and not pd.isna(val):
+                totals[n] = (totals[n] or 0.0) + float(val)
     return totals
 
 
 def _day_nutrients(meals: dict[str, Meal]) -> dict[str, float]:
-    totals = {n: 0.0 for n in TRACKED}
+    """
+    Sum nutrients across all meals in a day.
+    A nutrient is None only if every meal returned None for it.
+    """
+    totals = {n: None for n in TRACKED}
     for meal in meals.values():
         for n, v in _meal_nutrients(meal).items():
-            totals[n] += v
+            if v is not None:
+                totals[n] = (totals[n] or 0.0) + v
     return totals
 
 
@@ -134,8 +146,15 @@ class NutrientAnalyser:
             for nutrient, rda_val in self.rda.items():
                 if nutrient not in TRACKED or not rda_val:
                     continue
-                actual = totals.get(nutrient) or 0
+                actual = totals.get(nutrient)   # None = no data, 0.0 = genuinely zero
+                if actual is None:
+                    continue
                 ratio  = actual / rda_val
+
+                # Only flag if we actually have data — None means no foods
+                # reported this nutrient, not that the value is zero
+                if actual is None:
+                    continue
 
                 if nutrient == "sodium_mg":
                     if ratio > SODIUM_CAP_RATIO:
@@ -163,16 +182,30 @@ class NutrientAnalyser:
     def weekly_summary(self) -> dict:
         """
         Weekly average for each nutrient + % of RDA.
-        Returned as a flat dict suitable for display.
+        Only averages days where the nutrient was actually reported —
+        days with no data (None) are excluded from the average, not
+        treated as zero. This prevents genuine readings from being
+        diluted by missing-data days.
         """
         report = self.daily_report()
         summary = {}
         for nutrient in TRACKED:
-            vals   = [dn.totals.get(nutrient) or 0 for dn in report]
-            avg    = sum(vals) / len(vals) if vals else 0
-            rda_v  = self.rda.get(nutrient) or 1
-            pct    = round(avg / rda_v * 100, 1)
-            label  = NUTRIENT_LABELS.get(nutrient, nutrient)
+            # Only include days that have real data for this nutrient
+            vals = [
+                dn.totals.get(nutrient)
+                for dn in report
+                if dn.totals.get(nutrient) is not None
+            ]
+            if not vals:
+                # Truly no data across the entire week
+                label = NUTRIENT_LABELS.get(nutrient, nutrient)
+                summary[label] = {"avg_daily": float("nan"), "pct_rda": float("nan")}
+                continue
+
+            avg   = sum(vals) / len(vals)
+            rda_v = self.rda.get(nutrient) or 1
+            pct   = round(avg / rda_v * 100, 1)
+            label = NUTRIENT_LABELS.get(nutrient, nutrient)
             summary[label] = {"avg_daily": round(avg, 2), "pct_rda": pct}
         return summary
 
@@ -252,7 +285,7 @@ if __name__ == "__main__":
         summary = analyser.weekly_summary()
         print("\nWeekly Averages:")
         for label, vals in summary.items():
-            bar_len = min(int((vals["pct_rda"] if vals["pct_rda"] == vals["pct_rda"] else 0) / 5), 20)
+            bar_len = min(int(vals["pct_rda"] / 5), 20)
             bar = "█" * bar_len
             flag = " ⚠️" if vals["pct_rda"] < 80 else ""
             print(f"  {label:<25} {vals['avg_daily']:>8.1f}  {vals['pct_rda']:>5.1f}% {bar}{flag}")

@@ -6,6 +6,7 @@ Run with: streamlit run app.py
 import time
 import streamlit as st
 import pandas as pd
+import re
 import plotly.graph_objects as go
 import plotly.express as px
 
@@ -196,8 +197,35 @@ div[data-testid="stMetric"] {
     padding: 0.9rem 1.1rem;
     border: 1px solid #e2ddd4;
 }
-div[data-testid="stMetricLabel"] { color: #666 !important; font-size: 0.82rem !important; }
+div[data-testid="stMetricLabel"] { color: #555555 !important; font-size: 0.82rem !important; }
+div[data-testid="stMetricLabel"] p { color: #555555 !important; }
 div[data-testid="stMetricValue"] { color: #1a1a1a !important; }
+div[data-testid="stMetricValue"] > div { color: #1a1a1a !important; }
+div[data-testid="stMetricDelta"] { color: #2d6a4f !important; }
+
+/* Force all main content text to dark — prevents sidebar dark theme bleeding */
+section[data-testid="stMain"] p,
+section[data-testid="stMain"] span,
+section[data-testid="stMain"] label,
+section[data-testid="stMain"] div:not([data-testid="stSidebar"]) {
+    color: #1a1a1a;
+}
+
+/* Landing page stat cards specifically */
+div[data-testid="stMetricLabel"] * { color: #666666 !important; }
+div[data-testid="stMetricValue"] * { color: #1a1a1a !important; }
+
+/* Tab labels */
+button[data-baseweb="tab"] p { color: #444444 !important; }
+button[data-baseweb="tab"][aria-selected="true"] p { color: #2d6a4f !important; }
+
+/* Headings */
+section[data-testid="stMain"] h1,
+section[data-testid="stMain"] h2,
+section[data-testid="stMain"] h3 { color: #1a1a1a !important; }
+
+/* Plotly chart container background */
+div[data-testid="stPlotlyChart"] { background: white; border-radius: 10px; padding: 0.5rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -356,10 +384,57 @@ if st.session_state.generated and st.session_state.plan:
                         )
                         continue
 
+                    def clean_food_name(raw: str) -> str:
+                        """
+                        Convert USDA-style names to readable form.
+                        'Bread, white, commercially prepared, low sodium' → 'White Bread'
+                        'Chicken, broiler, rotisserie, BBQ, breast' → 'Rotisserie BBQ Chicken Breast'
+                        'From Fast Food / Restaurant Ns As To Type Beans' → 'Beans'
+                        
+                        Strategy: Strip administrative placeholders, drop trailing qualifiers 
+                        after the 2nd comma, reverse the leading category, and title-case.
+                        """
+                        if not raw:
+                            return ""
+
+                        # 1. Strip annoying USDA administrative restaurant prefixes
+                        cleaned_raw = re.sub(r"from fast food\s*/\s*restaurant\s*,?\s*", "", raw, flags=re.IGNORECASE)
+                        cleaned_raw = re.sub(r"restaurant\s*,?\s*", "", cleaned_raw, flags=re.IGNORECASE)
+                        
+                        # Clear out bureaucratic "Not Further Specified" (NFS / NS) placeholders
+                        cleaned_raw = re.sub(r"\bns\s+as\s+to\s+type\b", "", raw, flags=re.IGNORECASE)
+                        cleaned_raw = re.sub(r"\bnfs\b", "", cleaned_raw, flags=re.IGNORECASE)
+                        cleaned_raw = re.sub(r"\bns\b", "", cleaned_raw, flags=re.IGNORECASE)
+                        cleaned_raw = re.sub(r"\bnot\s+specified\b", "", cleaned_raw, flags=re.IGNORECASE)
+
+                        # 3. Clean up formatting artifacts left behind by the removals
+                        cleaned_raw = re.sub(r"\s+", " ", cleaned_raw)
+                        cleaned_raw = re.sub(r",\s*,", ",", cleaned_raw)
+                        cleaned_raw = cleaned_raw.strip().strip(",").strip()
+
+                        # 4. Run original comma parsing split logic
+                        parts = [p.strip() for p in cleaned_raw.split(",")]
+                        if len(parts) == 1:
+                            return parts[0].title()[:90]
+                            
+                        # Drop generic trailing qualifiers
+                        drop = {
+                            "commercially prepared", "home prepared", "cooked", "raw",
+                            "unenriched", "enriched", "frozen", "canned", "ready-to-heat",
+                            "prepared from recipe", "low sodium", "reduced fat", "whole grain"
+                        }
+                        kept = [p for p in parts[1:] if p.lower() not in drop]
+                        
+                        # Rebuild: meaningful descriptors + base noun
+                        base = parts[0]
+                        desc = " ".join(kept[:2])   # max 2 descriptors
+                        name = f"{desc} {base}".strip() if desc else base
+                        
+                        # Expanded slice length ensures long consumer product descriptions aren't abruptly truncated
+                        return name.title()[:90]
+
                     food_items_html = "".join(
-                        f'<span class="meal-food-item">'
-                        + (f["name"] if len(f["name"]) <= 48 else f["name"][:46] + "…")
-                        + '</span>'
+                        f'<span class="meal-food-item">• {clean_food_name(f["name"])}</span>'
                         for f in meal.foods
                     )
 
@@ -369,9 +444,9 @@ if st.session_state.generated and st.session_state.plan:
                         <div class="meal-foods">{food_items_html}</div>
                         <div class="meal-macros">
                             <span class="macro-pill kcal">{meal.calories:.0f} kcal</span>
-                            <span class="macro-pill">P {meal.protein_g:.0f}g</span>
-                            <span class="macro-pill">C {meal.carbs_g:.0f}g</span>
-                            <span class="macro-pill">F {meal.fat_g:.0f}g</span>
+                            <span class="macro-pill">Protein {meal.protein_g:.0f}g</span>
+                            <span class="macro-pill">Carbs {meal.carbs_g:.0f}g</span>
+                            <span class="macro-pill">Fat {meal.fat_g:.0f}g</span>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -383,29 +458,39 @@ if st.session_state.generated and st.session_state.plan:
         summary = analyser.weekly_summary()
         flags   = analyser.rda_flags()
 
-        # Summary bar chart
-        labels, pct_vals, colours = [], [], []
+        # Summary bar chart — only show nutrients with known data
+        labels, pct_vals, colours, bar_text = [], [], [], []
         for label, vals in summary.items():
-            pct = vals["pct_rda"] if vals["pct_rda"] == vals["pct_rda"] else 0
-            labels.append(label.split(" (")[0])   # strip units for chart
-            pct_vals.append(min(pct, 200))
-            colours.append("#e85d4a" if pct < 80 else "#2d6a4f" if pct <= 120 else "#f0a500")
+            pct = vals["pct_rda"]
+            is_nan = (pct != pct)
+            short_label = label.split(" (")[0]
+            labels.append(short_label)
+            if is_nan:
+                pct_vals.append(4)   # tiny sliver so bar is visible
+                colours.append("#e8e4dd")
+                bar_text.append("—")
+            else:
+                pct_vals.append(min(pct, 200))
+                colours.append("#e85d4a" if pct < 80 else "#2d6a4f" if pct <= 120 else "#f0a500")
+                bar_text.append(f"{pct:.0f}%")
 
         fig = go.Figure(go.Bar(
             x=labels, y=pct_vals,
             marker_color=colours,
-            text=[f"{v:.0f}%" for v in pct_vals],
+            text=bar_text,
             textposition="outside",
         ))
-        fig.add_hline(y=100, line_dash="dash", line_color="#888", annotation_text="RDA 100%")
-        fig.add_hline(y=80,  line_dash="dot",  line_color="#e85d4a", annotation_text="80% threshold")
+        fig.add_hline(y=80,  line_dash="dot",  line_color="#e85d4a", annotation_text="80% RDA")
         fig.update_layout(
             title="Weekly Average — % of RDA",
             yaxis_title="% of RDA", xaxis_title="",
             plot_bgcolor="white", paper_bgcolor="white",
             font_family="DM Sans",
-            height=380, margin=dict(t=50, b=60),
-            yaxis=dict(range=[0, 220]),
+            font=dict(color="#1a1a1a", size=11),
+            title_font=dict(color="#1a1a1a", size=13),
+            height=380, margin=dict(t=50, b=80),
+            yaxis=dict(range=[0, 220], tickfont=dict(color="#333333")),
+            xaxis=dict(tickfont=dict(color="#333333"), tickangle=-30),
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -427,15 +512,34 @@ if st.session_state.generated and st.session_state.plan:
             yaxis_title="kcal", xaxis_title="",
             plot_bgcolor="white", paper_bgcolor="white",
             font_family="DM Sans", height=280,
+            font=dict(color="#1a1a1a", size=11),
+            title_font=dict(color="#1a1a1a", size=13),
+            yaxis=dict(tickfont=dict(color="#333333")),
+            xaxis=dict(tickfont=dict(color="#333333")),
             margin=dict(t=40, b=40),
         )
         st.plotly_chart(fig2, use_container_width=True)
 
-        # RDA flags table
+        # RDA flags grouped by day
         st.subheader("RDA Flags")
         if flags:
+            # Group by day number parsed from flag string "Day N: ..."
+            from collections import defaultdict
+            by_day = defaultdict(list)
             for f in flags:
-                st.markdown(f'<div class="flag-box">⚠ {f}</div>', unsafe_allow_html=True)
+                import re as _re
+                m = _re.match(r"Day (\d+):", f)
+                day_key = int(m.group(1)) if m else 0
+                by_day[day_key].append(f)
+
+            for day_num in sorted(by_day.keys()):
+                day_flags = by_day[day_num]
+                label = f"Day {day_num}" if day_num else "General"
+                with st.expander(f"⚠ {label} — {len(day_flags)} flag{'s' if len(day_flags)>1 else ''}", expanded=False):
+                    for f in day_flags:
+                        # Strip "Day N: " prefix since it's already in the header
+                        text = _re.sub(r"^Day \d+: ", "", f)
+                        st.markdown(f'<div class="flag-box">⚠ {text}</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="ok-box">✓ All nutrients within RDA targets</div>',
                         unsafe_allow_html=True)
@@ -444,12 +548,16 @@ if st.session_state.generated and st.session_state.plan:
         with st.expander("Full nutrient breakdown"):
             rows = []
             for label, vals in summary.items():
-                pct = vals["pct_rda"] if vals["pct_rda"] == vals["pct_rda"] else 0
+                avg = vals["avg_daily"]
+                pct = vals["pct_rda"]
+                is_nan = (avg != avg) or (pct != pct)  # NaN check
                 rows.append({
-                    "Nutrient":    label,
-                    "Daily Avg":   f"{vals['avg_daily']:.1f}",
-                    "% of RDA":    f"{pct:.1f}%",
-                    "Status":      "✓" if 80 <= pct <= 150 else ("⚠ Low" if pct < 80 else "⚠ High"),
+                    "Nutrient":  label,
+                    "Daily Avg": "Unknown" if is_nan else f"{avg:.1f}",
+                    "% of RDA":  "Unknown" if is_nan else f"{pct:.1f}%",
+                    "Status":    "—" if is_nan else (
+                        "✓" if 80 <= pct <= 150 else ("⚠ Low" if pct < 80 else "⚠ High")
+                    ),
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 

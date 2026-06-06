@@ -132,7 +132,8 @@ class AllergenBloomIndex:
 def benchmark(df: pd.DataFrame, n_lookups: int = 10_000):
     """
     Compare Bloom filter vs. naive DataFrame query for allergen checking.
-    Prints a table of results — include this in the technical brief.
+    pre indexes 9 allergen sets into bloom fiters with an O(1) req
+    hashing the fdc id and checking the bit array
     """
     import random
 

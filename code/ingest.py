@@ -46,10 +46,10 @@ NUTRIENT_MAP = {
     1092: "potassium_mg",
     1090: "magnesium_mg",
     1095: "zinc_mg",
-    1114: "vitamin_d_iu",
+    1110: "vitamin_d_iu",   # D2+D3 — correct ID (1114=D4 is wrong)
     1178: "vitamin_b12_ug",
     1093: "sodium_mg",
-    1316: "omega3_g",
+    # 1316 omega3_g removed — sub-fraction ID, too sparse across all USDA data types
 }
 
 # ── Allergen keyword sets ──────────────────────────────────────────────────────
@@ -166,9 +166,16 @@ def tag_food(name: str, ingredients: str) -> dict:
 def extract_nutrients(food_nutrients: list) -> dict:
     result = {col: None for col in NUTRIENT_MAP.values()}
     for n in (food_nutrients or []):
+        # USDA uses two different structures depending on data type:
+        # SR Legacy / Foundation: {"nutrient": {"id": 1008}, "amount": 717}
+        # Branded / FNDDS:        {"nutrientId": 1008, "value": 459}
         nid = n.get("nutrient", {}).get("id") or n.get("nutrientId")
         if nid in NUTRIENT_MAP:
-            result[NUTRIENT_MAP[nid]] = n.get("amount")
+            # Try "amount" first (SR Legacy), fall back to "value" (Branded/FNDDS)
+            val = n.get("amount")
+            if val is None:
+                val = n.get("value")
+            result[NUTRIENT_MAP[nid]] = val
     return result
 
 
@@ -266,11 +273,11 @@ INSERT OR IGNORE INTO foods (
     :fdc_id, :name, :data_type, :food_category, :ingredients,
     :calories, :protein_g, :carbs_g, :fat_g, :fibre_g,
     :calcium_mg, :iron_mg, :potassium_mg, :magnesium_mg, :zinc_mg,
-    :vitamin_d_iu, :vitamin_b12_ug, :sodium_mg, :omega3_g,
+    :vitamin_d_iu, :vitamin_b12_ug, :sodium_mg,
     :is_high_fodmap, :is_gerd_trigger,
     :contains_gluten, :contains_dairy, :contains_tree_nuts, :contains_peanut,
     :contains_shellfish, :contains_soy, :contains_egg, :contains_fish, :contains_sesame,
-    :is_vegan, :is_vegetarian, :is_pescatarian, :is_non_veg, NULL
+    :is_vegan, :is_vegetarian, :is_pescatarian, :is_non_veg, :glycaemic_index
 )
 """
 
@@ -302,6 +309,25 @@ def insert_food(conn: sqlite3.Connection, food: dict, data_type: str):
 
     nutrients = extract_nutrients(food.get("foodNutrients") or [])
     flags     = tag_food(name, ingredients)
+
+    #integrated GI Handling
+    name_low = name.lower()
+    cat_low = category.lower()
+    gi_value = 25.0
+    HIGH_GI_KEYWORDS = (
+        "sugar", "soda", "pie", "cake", "candy", "waffle", "syrup", "honey",
+        "ice cream", "sweetened", "topping", "dessert", "cone", "pastry", 
+        "cookie", "doughnut", "donut", "pudding", "sweet", "soft serve",
+        "whipped topping", "condensed milk"
+    )
+    if any(k in name_low for k in HIGH_GI_KEYWORDS):
+        gi_value = 85.0
+    elif "baked products" in cat_low or "bread" in name_low:
+        gi_value = 75.0
+    elif any(k in name_low for k in ("rice", "potato", "corn", "banana", "cereal")):
+        gi_value = 62.0
+    elif "cereal grains and pasta" in cat_low:
+        gi_value = 50.0
 
     conn.execute(INSERT_SQL, {
         "fdc_id": fdc_id, "name": name, "data_type": dt,
@@ -388,12 +414,36 @@ def retag():
         return
 
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT fdc_id, name, ingredients FROM foods").fetchall()
-    print(f"Re-tagging {len(rows):,} rows…")
+    rows = conn.execute("SELECT fdc_id, name, food_category, ingredients FROM foods").fetchall()
+    print(f"Re-tagging {len(rows):,} rows and computing Glycaemic Index...")
 
     batch = []
-    for fdc_id, name, ingredients in tqdm(rows):
+    for fdc_id, name, category, ingredients in tqdm(rows):
         f = tag_food(name or "", ingredients or "")
+        cat_low = (category or "").lower()
+        name_low = (name or "").lower()
+        
+        # Determine Glycaemic Index using expanded international GI database baselines
+        gi_value = 25.0  # Safe low-GI default for fresh meats, fats, non-starchy vegetables
+        
+        # Comprehensive high-GI keyword trigger registry
+        HIGH_GI_KEYWORDS = (
+        "sugar", "soda", "pie", "cake", "candy", "waffle", "syrup", "honey",
+        "ice cream", "sweetened", "topping", "dessert", "cone", "pastry", 
+        "cookie", "doughnut", "donut", "pudding", "sweet", "soft serve",
+        "whipped topping", "condensed milk", "puff", "crisp", "cobbler", 
+        "beignet", "basbousa", "biscuit", "cracker", "bagel", "toast", "bar"
+        )
+        
+        if any(k in name_low for k in HIGH_GI_KEYWORDS):
+            gi_value = 85.0  # High GI - Will be caught by Diabetes filter caps
+        elif "baked products" in cat_low or "bread" in name_low:
+            gi_value = 75.0  # High GI
+        elif any(k in name_low for k in ("rice", "potato", "corn", "banana", "cereal")):
+            gi_value = 62.0  # Medium GI
+        elif "cereal grains and pasta" in cat_low:
+            gi_value = 50.0  # Low GI
+
         batch.append((
             int(f["is_high_fodmap"]),     int(f["is_gerd_trigger"]),
             int(f["contains_gluten"]),    int(f["contains_dairy"]),
@@ -403,16 +453,30 @@ def retag():
             int(f["contains_sesame"]),
             int(f["is_vegan"]),           int(f["is_vegetarian"]),
             int(f["is_pescatarian"]),     int(f["is_non_veg"]),
+            gi_value,                     # Populate the glycaemic_index column
             fdc_id,
         ))
         if len(batch) >= 500:
-            _flush(conn, batch); batch = []
+            _flush_with_gi(conn, batch); batch = []
     if batch:
-        _flush(conn, batch)
+        _flush_with_gi(conn, batch)
 
     conn.close()
-    print("✅ Retag done.")
+    print("✅ Retag and GI population done.")
     verify_db()
+
+def _flush_with_gi(conn, batch):
+    conn.executemany("""
+        UPDATE foods SET
+            is_high_fodmap=?,     is_gerd_trigger=?,
+            contains_gluten=?,    contains_dairy=?,    contains_tree_nuts=?,
+            contains_peanut=?,    contains_shellfish=?, contains_soy=?,
+            contains_egg=?,       contains_fish=?,     contains_sesame=?,
+            is_vegan=?,           is_vegetarian=?,     is_pescatarian=?,
+            is_non_veg=?,         glycaemic_index=?
+        WHERE fdc_id=?
+    """, batch)
+    conn.commit()
 
 
 def _flush(conn, batch):
@@ -427,6 +491,89 @@ def _flush(conn, batch):
         WHERE fdc_id=?
     """, batch)
     conn.commit()
+
+
+# ── Backfill ───────────────────────────────────────────────────────────────────
+
+def backfill(api_key: str):
+    """
+    Re-fetch full records for rows missing nutrients due to the
+    'amount' vs 'value' field-name bug in earlier versions.
+    Only updates rows where calories or protein_g is NULL.
+
+    Usage:
+        python ingest.py --api-key YOUR_KEY --backfill
+    """
+    if not DB_PATH.exists():
+        print("\u274c DB not found. Run ingest first.")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """SELECT fdc_id FROM foods WHERE
+           calcium_mg IS NULL OR potassium_mg IS NULL OR
+           fibre_g IS NULL OR magnesium_mg IS NULL OR
+           vitamin_d_iu IS NULL OR vitamin_b12_ug IS NULL"""
+    ).fetchall()
+    fdc_ids = [r[0] for r in rows]
+
+    if not fdc_ids:
+        print("\u2705 No rows with missing nutrients — nothing to backfill.")
+        conn.close()
+        verify_db()
+        return
+
+    print(f"\u26a1 Backfilling {len(fdc_ids):,} rows with missing nutrient data...")
+    updated = 0
+    pbar = tqdm(total=len(fdc_ids), unit="foods")
+
+    for i in range(0, len(fdc_ids), BATCH_SIZE):
+        chunk = fdc_ids[i:i + BATCH_SIZE]
+        try:
+            foods = fetch_details(api_key, chunk)
+        except requests.HTTPError as e:
+            print(f"\n\u26a0\ufe0f  API error at offset {i}: {e}")
+            time.sleep(2)
+            continue
+
+        for food in foods:
+            fdc_id      = food.get("fdcId")
+            name        = (food.get("description") or "").strip()
+            ingredients = (food.get("ingredients") or "").strip()
+            nutrients   = extract_nutrients(food.get("foodNutrients") or [])
+            flags       = tag_food(name, ingredients)
+
+            conn.execute("""
+                UPDATE foods SET
+                    ingredients    = COALESCE(NULLIF(:ingredients, \'\'), ingredients),
+                    calories       = :calories,       protein_g      = :protein_g,
+                    carbs_g        = :carbs_g,        fat_g          = :fat_g,
+                    fibre_g        = :fibre_g,        calcium_mg     = :calcium_mg,
+                    iron_mg        = :iron_mg,        potassium_mg   = :potassium_mg,
+                    magnesium_mg   = :magnesium_mg,   zinc_mg        = :zinc_mg,
+                    vitamin_d_iu   = :vitamin_d_iu,   vitamin_b12_ug = :vitamin_b12_ug,
+                    sodium_mg      = :sodium_mg,      
+                    is_high_fodmap=:is_high_fodmap,   is_gerd_trigger=:is_gerd_trigger,
+                    contains_gluten=:contains_gluten, contains_dairy=:contains_dairy,
+                    contains_tree_nuts=:contains_tree_nuts, contains_peanut=:contains_peanut,
+                    contains_shellfish=:contains_shellfish, contains_soy=:contains_soy,
+                    contains_egg=:contains_egg,       contains_fish=:contains_fish,
+                    contains_sesame=:contains_sesame,
+                    is_vegan=:is_vegan,               is_vegetarian=:is_vegetarian,
+                    is_pescatarian=:is_pescatarian,   is_non_veg=:is_non_veg
+                WHERE fdc_id = :fdc_id
+            """, {"fdc_id": fdc_id, "ingredients": ingredients,
+                  **nutrients, **{k: int(v) for k, v in flags.items()}})
+            updated += 1
+            pbar.update(1)
+
+        conn.commit()
+        time.sleep(0.1)
+
+    pbar.close()
+    conn.close()
+    print(f"\n\u2705 Backfill complete — updated {updated:,} rows.")
+    verify_db()
 
 
 # ── Verify ─────────────────────────────────────────────────────────────────────
@@ -467,13 +614,18 @@ if __name__ == "__main__":
     parser.add_argument("--target",  type=int, default=10000, help="Min records to ingest")
     parser.add_argument("--reset",   action="store_true", help="Wipe DB and snapshot, re-ingest from scratch")
     parser.add_argument("--verify",  action="store_true", help="Print DB stats and exit")
-    parser.add_argument("--retag",   action="store_true", help="Re-run tagging on existing rows (no API needed)")
+    parser.add_argument("--retag",    action="store_true", help="Re-run tagging on existing rows (no API needed)")
+    parser.add_argument("--backfill", action="store_true", help="Re-fetch nutrients for rows missing calorie/protein data")
     args = parser.parse_args()
 
     if args.verify:
         verify_db()
     elif args.retag:
         retag()
+    elif args.backfill:
+        if not args.api_key:
+            parser.error("--api-key is required for --backfill")
+        backfill(api_key=args.api_key)
     else:
         if not args.api_key:
             parser.error("--api-key is required")
